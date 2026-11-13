@@ -1,7 +1,11 @@
-﻿using System.Net.Http.Json;
+﻿using System.Globalization;
+using System.Net.Http.Json;
+using System.Security.Cryptography;
 using System.Text.Json;
 
 const string apiEndpoint = "https://localhost:44390/api/getcheckinfo";
+const string updateApiEndpoint = "https://localhost:44390/api/updatecheckstatus";
+var jsonOptions = new JsonSerializerOptions { WriteIndented = true };
 string[] columns = ["BusPartner", "Name", "National ID", "Cheque Number", "Status", "Amount Paid"];
 using var httpClient = new HttpClient();
 
@@ -23,7 +27,10 @@ while (true)
 
     try
     {
-        using var response = await httpClient.PostAsJsonAsync(apiEndpoint, new { bp = bpNumber, check = checkNumber });
+        var lookupRequest = new { bp = bpNumber, check = checkNumber };
+        Console.WriteLine($"POST {apiEndpoint}");
+        Console.WriteLine(JsonSerializer.Serialize(lookupRequest, jsonOptions));
+        using var response = await httpClient.PostAsJsonAsync(apiEndpoint, lookupRequest, jsonOptions);
         if (!response.IsSuccessStatusCode)
         {
             var errorBody = await response.Content.ReadAsStringAsync();
@@ -54,9 +61,55 @@ while (true)
                     {
                         Console.Write("Cash this cheque? (Y/N): ");
                         var cashChoice = Console.ReadLine();
-                        Console.WriteLine(cashChoice?.Trim().Equals("Y", StringComparison.OrdinalIgnoreCase) == true
-                            ? "Cash selection: Yes."
-                            : "Cash selection: No.");
+                        if (cashChoice?.Trim().Equals("Y", StringComparison.OrdinalIgnoreCase) == true)
+                        {
+                            var nisNumber = GetValue(item, "NISNumber");
+                            if (string.IsNullOrWhiteSpace(nisNumber))
+                            {
+                                nisNumber = GetValue(item, "NIS Number");
+                            }
+
+                            if (string.IsNullOrWhiteSpace(nisNumber))
+                            {
+                                Console.Write("NIS Number: ");
+                                nisNumber = Console.ReadLine();
+                            }
+
+                            if (string.IsNullOrWhiteSpace(nisNumber))
+                            {
+                                Console.WriteLine("Cannot generate the JSON without an NIS number.");
+                            }
+                            else if (!TryGetDecimal(item, "Amount Paid", out var chequeAmount))
+                            {
+                                Console.WriteLine("Cannot generate the JSON: Amount Paid is missing or invalid.");
+                            }
+                            else
+                            {
+                                var cashRequest = new
+                                {
+                                    chequeNumber = GetValue(item, "Cheque Number"),
+                                    postOfficeCode = GeneratePostOfficeCode(),
+                                    nationalRegistrationNumber = GetValue(item, "National ID"),
+                                    chequeAmount,
+                                    NISNumber = nisNumber.Trim(),
+                                    cashedDate = DateOnly.FromDateTime(DateTime.Today)
+                                };
+
+                                Console.WriteLine($"POST {updateApiEndpoint}");
+                                Console.WriteLine("Cash request JSON:");
+                                Console.WriteLine(JsonSerializer.Serialize(cashRequest, jsonOptions));
+
+                                using var updateResponse = await httpClient.PostAsJsonAsync(updateApiEndpoint, cashRequest, jsonOptions);
+                                var updateResponseBody = await updateResponse.Content.ReadAsStringAsync();
+                                var responseLabel = updateResponse.IsSuccessStatusCode ? "Update API response" : "Update API request failed";
+                                Console.WriteLine($"{responseLabel} ({(int)updateResponse.StatusCode} {updateResponse.ReasonPhrase}):");
+                                Console.WriteLine(string.IsNullOrWhiteSpace(updateResponseBody) ? "(empty response)" : updateResponseBody);
+                            }
+                        }
+                        else
+                        {
+                            Console.WriteLine("Cash selection: No.");
+                        }
                     }
 
                     Console.WriteLine();
@@ -90,4 +143,28 @@ static string GetValue(JsonElement item, string propertyName)
     }
 
     return value.ValueKind == JsonValueKind.String ? value.GetString() ?? string.Empty : value.ToString();
+}
+
+static bool TryGetDecimal(JsonElement item, string propertyName, out decimal result)
+{
+    result = 0;
+    if (item.ValueKind != JsonValueKind.Object || !item.TryGetProperty(propertyName, out var value))
+    {
+        return false;
+    }
+
+    if (value.ValueKind == JsonValueKind.Number)
+    {
+        return value.TryGetDecimal(out result);
+    }
+
+    return value.ValueKind == JsonValueKind.String
+        && decimal.TryParse(value.GetString(), NumberStyles.Number, CultureInfo.InvariantCulture, out result);
+}
+
+static string GeneratePostOfficeCode()
+{
+    var digits = string.Concat(Enumerable.Range(0, 9).Select(_ => RandomNumberGenerator.GetInt32(10)));
+    var suffix = (char)('A' + RandomNumberGenerator.GetInt32(26));
+    return $"GPS{digits}{suffix}";
 }
